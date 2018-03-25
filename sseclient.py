@@ -1,8 +1,7 @@
-import codecs
 import re
 import time
 import warnings
-
+import threading
 import six
 
 import requests
@@ -13,15 +12,16 @@ import requests
 end_of_field = re.compile(r'\r\n\r\n|\r\r|\n\n')
 
 class SSEClient(object):
-    def __init__(self, url, last_id=None, retry=3000, session=None, chunk_size=1024, **kwargs):
+    def __init__(self, url, session, build_headers, last_id=None, retry=3000, **kwargs):
         self.url = url
         self.last_id = last_id
         self.retry = retry
-        self.chunk_size = chunk_size
-
+        self.running = True
         # Optional support for passing in a requests.Session()
         self.session = session
-
+        # function for building auth header when token expires
+        self.build_headers = build_headers
+        self.start_time = None
         # Any extra kwargs will be fed into the requests.get call later.
         self.requests_kwargs = kwargs
 
@@ -41,11 +41,13 @@ class SSEClient(object):
     def _connect(self):
         if self.last_id:
             self.requests_kwargs['headers']['Last-Event-ID'] = self.last_id
-
+        headers = self.build_headers()
+        self.requests_kwargs['headers'].update(headers)
         # Use session if set.  Otherwise fall back to requests module.
-        requester = self.session or requests
-        self.resp = requester.get(self.url, stream=True, **self.requests_kwargs)
-        self.resp_iterator = self.resp.iter_content(chunk_size=self.chunk_size)
+        self.requester = self.session or requests
+        self.resp = self.requester.get(self.url, stream=True, **self.requests_kwargs)
+
+        self.resp_iterator = self.resp.iter_content(decode_unicode=True)
 
         # TODO: Ensure we're handling redirects.  Might also stick the 'origin'
         # attribute on Events like the Javascript spec requires.
@@ -58,16 +60,11 @@ class SSEClient(object):
         return self
 
     def __next__(self):
-        decoder = codecs.getincrementaldecoder(
-            self.resp.encoding)(errors='replace')
         while not self._event_complete():
             try:
-                next_chunk = next(self.resp_iterator)
-                if not next_chunk:
-                    raise EOFError()
-                self.buf += decoder.decode(next_chunk)
-
-            except (StopIteration, requests.RequestException, EOFError) as e:
+                nextchar = next(self.resp_iterator)
+                self.buf += nextchar
+            except (StopIteration, requests.RequestException):
                 time.sleep(self.retry / 1000.0)
                 self._connect()
 
@@ -77,11 +74,19 @@ class SSEClient(object):
                 self.buf = head + sep
                 continue
 
-        # Split the complete event (up to the end_of_field) into event_string,
-        # and retain anything after the current complete event in self.buf
-        # for next time.
-        (event_string, self.buf) = re.split(end_of_field, self.buf, maxsplit=1)
-        msg = Event.parse(event_string)
+        split = re.split(end_of_field, self.buf)
+        head = split[0]
+        tail = "".join(split[1:])
+
+        self.buf = tail
+        msg = Event.parse(head)
+
+        if msg.data == "credential is no longer valid":
+            self._connect()
+            return None
+
+        if msg.data == 'null':
+            return None
 
         # If the server requests a specific retry delay, we need to honor it.
         if msg.retry:
@@ -130,18 +135,18 @@ class Event(object):
         and return a Event object.
         """
         msg = cls()
-        for line in raw.splitlines():
+        for line in raw.split('\n'):
             m = cls.sse_line_pattern.match(line)
             if m is None:
                 # Malformed line.  Discard but warn.
                 warnings.warn('Invalid SSE line: "%s"' % line, SyntaxWarning)
                 continue
 
-            name = m.group('name')
+            name = m.groupdict()['name']
+            value = m.groupdict()['value']
             if name == '':
                 # line began with a ":", so is a comment.  Ignore
                 continue
-            value = m.group('value')
 
             if name == 'data':
                 # If we already have some data, then join to it with a newline.
